@@ -14,8 +14,6 @@ import signal
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import fnmatch
 import pathspec
-from generator.patterns import PATTERNS
-from generator.prompts import get_ai_rules_prompt
 
 class TimeoutException(Exception):
     pass
@@ -79,6 +77,75 @@ def retry_on_429(max_retries=3, delay=2):
     return decorator
 
 class RulesGenerator:
+    # Common regex patterns for all languages
+    # Language groups:
+    # python: Python
+    # web: JavaScript, TypeScript, Java, Ruby
+    # system: C/C++, C#, PHP, Swift, Objective-C
+    PATTERNS = {
+        'import': {
+            'python': r'^(?:from\s+(?P<module>[a-zA-Z0-9_\.]+)\s+import\s+(?P<imports>[^#\n]+)|import\s+(?P<module2>[a-zA-Z0-9_\.]+(?:\s*,\s*[a-zA-Z0-9_\.]+)*))(?:\s*#[^\n]*)?$',
+            'web': r'(?:' + '|'.join([
+                r'import\s+.*?from\s+[\'"](?P<module>[^\'\"]+)[\'"]',  # ES6 import
+                r'require\s*\([\'"](?P<module2>[^\'\"]+)[\'"]\)',      # CommonJS require
+                r'import\s+(?:static\s+)?(?P<module3>[a-zA-Z0-9_\.]+(?:\.[*])?)',  # Java/TypeScript import
+                r'require\s+[\'"](?P<module4>[^\'\"]+)[\'"]',          # Ruby require
+                r'import\s+[\'"](?P<module5>[^\'\"]+)[\'"]'            # Plain import
+            ]) + ')',
+            'system': r'(?:' + '|'.join([
+                r'#include\s*[<"](?P<module>[^>"]+)[>"]',              # C/C++ include
+                r'using\s+(?:static\s+)?(?P<module2>[a-zA-Z0-9_\.]+)\s*;',  # C# using
+                r'namespace\s+(?P<module3>[a-zA-Z0-9_\\]+)',          # Namespace
+                r'import\s+(?P<module4>[^\n;]+)\s*;?',                # Swift/Kotlin import
+                r'#import\s*[<"](?P<module5>[^>"]+)[>"]'              # Objective-C import
+            ]) + ')',
+        },
+        'class': {
+            'python': r'(?:@\w+(?:\(.*?\))?\s+)*class\s+(?P<name>\w+)(?:\((?P<base>[^)]+)\))?\s*:(?:\s*[\'"](?P<docstring>[^\'"]*)[\'"])?',
+            'web': r'(?:' + '|'.join([
+                r'(?:export\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)(?:\s*(?:extends|implements)\s+(?P<base>[^{<]+))?(?:\s*<[^>]+>)?\s*{',  # Standard class
+                r'(?:export\s+)?(?:const|let|var)\s+(?P<name2>\w+)\s*=\s*class(?:\s+extends\s+(?P<base2>[^{]+))?\s*{',  # Class expression
+                r'(?:export\s+)?class\s+(?P<name3>\w+)\s*(?:<[^>]+>)?\s*(?:extends|implements)\s+(?P<base3>[^{]+)?\s*{'  # Generic class
+            ]) + ')',
+            'system': r'(?:' + '|'.join([
+                r'(?:(?:public|private|protected|internal|friend)\s+)*(?:abstract\s+)?(?:partial\s+)?(?:sealed\s+)?(?:class|struct|enum|union|@interface|@implementation)\s+(?P<name>\w+)(?:\s*(?::\s*|extends\s+|implements\s+)(?P<base>[^{;]+))?(?:\s*{)?',  # C++/C#/Java class
+                r'(?:@interface|@implementation)\s+(?P<name2>\w+)(?:\s*:\s*(?P<base2>[^{]+))?\s*{?'  # Objective-C interface/implementation
+            ]) + ')',
+        },
+        'function': {
+            'python': r'(?:@\w+(?:\(.*?\))?\s+)*def\s+(?P<name>\w+)\s*\((?P<params>[^)]*)\)(?:\s*->\s*(?P<return>[^:#]+))?\s*:(?:\s*[\'"](?P<docstring>[^\'"]*)[\'"])?',
+            'web': r'(?:' + '|'.join([
+                r'(?:export\s+)?(?:async\s+)?function\s*(?P<name>\w+)\s*(?:<[^>]+>)?\s*\((?P<params>[^)]*)\)(?:\s*:\s*(?P<return>[^{=]+))?\s*{',  # Standard function
+                r'(?:export\s+)?(?:const|let|var)\s+(?P<name2>\w+)\s*=\s*(?:async\s+)?(?:function\s*\*?|\([^)]*\)\s*=>)',  # Function expression/arrow
+                r'(?:public|private|protected)?\s*(?:static\s+)?(?:async\s+)?(?P<name3>\w+)\s*\((?P<params2>[^)]*)\)(?:\s*:\s*(?P<return2>[^{;]+))?\s*{?'  # Method
+            ]) + ')',
+            'system': r'(?:' + '|'.join([
+                r'(?:(?:public|private|protected|internal|friend)\s+)*(?:static\s+)?(?:virtual\s+)?(?:override\s+)?(?:async\s+)?(?:[\w:]+\s+)?(?P<name>\w+)\s*\((?P<params>[^)]*)\)(?:\s*(?:const|override|final|noexcept))?\s*(?:{\s*)?',  # C++/C#/Java method
+                r'[-+]\s*\((?P<return>[^)]+)\)(?P<name2>\w+)(?::\s*\((?P<paramtype>[^)]+)\)(?P<param>\w+))*'  # Objective-C method
+            ]) + ')',
+        },
+        'common': {
+            'method': r'(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:async\s+)?(?P<name>\w+)\s*\((?P<params>[^)]*)\)(?:\s*:\s*(?P<return>[^{]+))?\s*{',
+            'variable': r'(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:const|let|var|final)\s+(?P<name>\w+)\s*(?::\s*(?P<type>[^=;]+))?\s*=\s*(?P<value>[^;]+)',
+            'error': r'try\s*{(?:[^{}]|{[^{}]*})*}\s*catch\s*\((?P<error>\w+)(?:\s*:\s*(?P<type>[^)]+))?\)',
+            'interface': r'(?:export\s+)?interface\s+(?P<name>\w+)(?:\s+extends\s+(?P<base>[^{]+))?\s*{(?:[^{}]|{[^{}]*})*}',
+            'jsx_component': r'<(?P<name>[A-Z]\w*)(?:\s+(?:(?!\/>)[^>])+)?>',
+            'react_hook': r'\buse[A-Z]\w+\b(?=\s*\()',
+            'next_api': r'export\s+(?:async\s+)?function\s+(?:getStaticProps|getStaticPaths|getServerSideProps)\s*\(',
+            'next_page': r'(?:pages|app)/(?!_)[^/]+(?:/(?!_)[^/]+)*\.(?:js|jsx|ts|tsx)$',
+            'next_layout': r'(?:layout|page|loading|error|not-found)\.(?:js|jsx|ts|tsx)$',
+            'next_middleware': r'middleware\.(?:js|jsx|ts|tsx)$',
+            'styled_component': r'(?:const\s+)?(?P<name>\w+)\s*=\s*styled(?:\.(?P<element>\w+)|(?:\([\w.]+\)))`[^`]*`'
+        },
+        'unity': {
+            'component': r'(?:public\s+)?class\s+\w+\s*:\s*(?:MonoBehaviour|ScriptableObject|EditorWindow)',
+            'lifecycle': r'(?:private\s+|protected\s+|public\s+)?(?:virtual\s+)?(?:override\s+)?void\s+(?:Awake|Start|Update|FixedUpdate|LateUpdate|OnEnable|OnDisable|OnDestroy|OnTriggerEnter|OnTriggerExit|OnCollisionEnter|OnCollisionExit|OnMouseDown|OnMouseUp|OnGUI)\s*\([^)]*\)',
+            'attribute': r'\[\s*(?:SerializeField|Header|Tooltip|Range|RequireComponent|ExecuteInEditMode|CreateAssetMenu|MenuItem)(?:\s*\(\s*(?P<params>[^)]+)\s*\))?\s*\]',
+            'type': r'\b(?:GameObject|Transform|Rigidbody|Collider|AudioSource|Camera|Light|Animator|ParticleSystem|Canvas|Image|Text|Button|Vector[23]|Quaternion)\b',
+            'event': r'(?:public\s+|private\s+|protected\s+)?UnityEvent\s*<\s*(?P<type>[^>]*)\s*>\s+(?P<name>\w+)',
+            'field': r'(?:public\s+|private\s+|protected\s+|internal\s+)?(?:\[SerializeField\]\s*)?(?P<type>\w+(?:<[^>]+>)?)\s+(?P<name>\w+)\s*(?:=\s*(?P<value>[^;]+))?;'
+        }
+    }
 
     # 默认排除的目录和文件
     DEFAULT_EXCLUDES = {
@@ -168,7 +235,7 @@ class RulesGenerator:
         compiled = {}
         
         # Compile patterns for each category
-        for category, patterns in PATTERNS.items():
+        for category, patterns in self.PATTERNS.items():
             compiled[category] = {}
             
             if isinstance(patterns, dict):
@@ -489,8 +556,120 @@ class RulesGenerator:
             # Analyze project
             project_structure = self._analyze_project_structure()
             
-            # 使用导入的 prompt 模板
-            prompt = get_ai_rules_prompt(project_info, project_structure)
+            # Create detailed prompt
+            prompt = f"""As an AI assistant working in Cursor IDE, analyze this project to understand how you should behave and generate code that perfectly matches the project's patterns and standards.
+
+Project Overview:
+Language: {project_info.get('language', 'unknown')}
+Framework: {project_info.get('framework', 'none')}
+Type: {project_info.get('type', 'generic')}
+Description: {project_info.get('description', 'Generic Project')}
+Primary Purpose: Code generation and project analysis
+
+Project Metrics:
+- Files & Structure:
+  - Total Files: {len(project_structure['files'])}
+  - Config Files: {len(project_structure['config_files'])}
+- Dependencies:
+  - Frameworks: {', '.join(project_structure['frameworks']) or 'none'}
+  - Core Dependencies: {', '.join(list(project_structure['dependencies'].keys())[:10])}
+  - Total Dependencies: {len(project_structure['dependencies'])}
+
+Project Ecosystem:
+1. Development Environment:
+- Project Structure:
+{chr(10).join([f"- {f}" for f in project_structure['files'] if f.endswith(('.json', '.md', '.env', '.gitignore'))][:5])}
+- IDE Configuration:
+{chr(10).join([f"- {f}" for f in project_structure['files'] if '.vscode' in f or '.idea' in f][:5])}
+- Build System:
+{chr(10).join([f"- {f}" for f in project_structure['files'] if f in ['setup.py', 'requirements.txt', 'package.json', 'Makefile', 'composer.json', 'Gemfile', 'CMakeLists.txt', 'build.gradle', 'pom.xml', 'webpack.config.js']])}
+
+2. Project Components:
+- Core Modules:
+{chr(10).join([f"- {f}: {sum(1 for p in project_structure['patterns']['function_patterns'] if p['file'] == f)} functions" for f in project_structure['files'] if f.endswith('.py, .js, .ts, .tsx, .kt, .php, .swift, .cpp, .c, .h, .hpp, .cs, .csx') and not any(x in f.lower() for x in ['setup', 'config'])][:5])}
+- Support Modules:
+{chr(10).join([f"- {f}" for f in project_structure['files'] if any(x in f.lower() for x in ['util', 'helper', 'common', 'shared'])][:5])}
+- Templates:
+{chr(10).join([f"- {f}" for f in project_structure['files'] if 'template' in f.lower()][:5])}
+
+3. Module Organization Analysis:
+- Core Module Functions:
+{chr(10).join([f"- {f}: Primary module handling {f.split('_')[0].title()} functionality" for f in project_structure['files'] if f.endswith('.py, .js, .ts, .tsx, .kt, .php, .swift, .cpp, .c, .h, .hpp, .cs, .csx') and not any(x in f.lower() for x in ['setup', 'config'])][:5])}
+
+- Module Dependencies:
+{chr(10).join([f"- {f} depends on: {', '.join(list(set([imp.split('.')[0] for imp in project_structure['patterns']['imports'] if imp in f])))}" for f in project_structure['files'] if f.endswith('.py, .js, .ts, .tsx, .kt, .php, .swift, .cpp, .c, .h, .hpp, .cs, .csx')][:5])}
+
+- Module Responsibilities:
+Please analyze each module's code and describe its core responsibilities based on:
+1. Function and class names
+2. Import statements
+3. Code patterns and structures
+4. Documentation strings
+5. Variable names and usage
+6. Error handling patterns
+7. Performance optimization techniques
+
+- Module Organization Rules:
+Based on the codebase analysis, identify and describe:
+1. Module organization patterns
+2. Dependency management approaches
+3. Code structure conventions
+4. Naming conventions
+5. Documentation practices
+6. Error handling strategies
+7. Performance optimization patterns
+
+Code Sample Analysis:
+{chr(10).join(f"File: {file}:{chr(10)}{content[:10000]}..." for file, content in list(project_structure['code_contents'].items())[:50])}
+
+Based on this detailed analysis, create behavior rules for AI to:
+1. Replicate the project's exact code style and patterns
+2. Match naming conventions precisely
+3. Follow identical error handling patterns
+4. Copy performance optimization techniques
+5. Maintain documentation consistency
+6. Keep current code organization
+7. Preserve module boundaries
+8. Use established logging methods
+9. Follow configuration patterns
+
+Return a JSON object defining AI behavior rules:
+{{"ai_behavior": {{
+    "code_generation": {{
+        "style": {{
+            "prefer": [],
+            "avoid": []
+        }},
+        "error_handling": {{
+            "prefer": [],
+            "avoid": []
+        }},
+        "performance": {{
+            "prefer": [],
+            "avoid": []
+        }},
+        "suggest_patterns": {{
+            "improve": [],
+            "avoid": []
+        }},
+        "module_organization": {{
+            "structure": [],  # Analyze and describe the current module structure
+            "dependencies": [],  # Analyze actual dependencies between modules
+            "responsibilities": {{}},  # Analyze and describe each module's core responsibilities
+            "rules": [],  # Extract rules from actual code organization patterns
+            "naming": {{}}  # Extract naming conventions from actual code
+        }}
+    }}
+}}}}
+
+Critical Guidelines for AI:
+1. NEVER deviate from existing code patterns
+2. ALWAYS match the project's exact style
+3. MAINTAIN the current complexity level
+4. COPY the existing skill level approach
+5. PRESERVE all established practices
+6. REPLICATE the project's exact style
+7. UNDERSTAND pattern purposes"""
     
             # Get AI response
             response = self.chat_session.send_message(prompt)
@@ -827,3 +1006,4 @@ Do not include technical metrics in the description."""
                 'name': match.group(2),
                 'file': rel_path
             })
+

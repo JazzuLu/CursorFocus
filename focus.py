@@ -8,6 +8,7 @@ from rules_generator import RulesGenerator
 from rules_watcher import ProjectWatcherManager
 import logging
 from auto_updater import AutoUpdater
+import argparse
 
 def retry_generate_rules(project_path, project_name, max_retries=3):
     """Retry generating rules file automatically."""
@@ -15,8 +16,11 @@ def retry_generate_rules(project_path, project_name, max_retries=3):
     while retries < max_retries:
         try:
             print(f"\n📄 Analyzing: {project_path}")
+            print("⏳ Initializing analyzer...")
             analyzer = RulesAnalyzer(project_path)
+            print("📊 Analyzing project structure...")
             project_info = analyzer.analyze_project_for_rules()
+            print("✓ Analysis completed")
             
             # Ask for format preference using numbers
             print("\nSelect format for .cursorrules file:")
@@ -32,6 +36,7 @@ def retry_generate_rules(project_path, project_name, max_retries=3):
                 except ValueError:
                     print("Please enter a number")
             
+            print("🔨 Generating rules file...")
             rules_generator = RulesGenerator(project_path)
             rules_file = rules_generator.generate_rules_file(project_info, format=format_choice)
             print(f"✓ {os.path.basename(rules_file)}")
@@ -114,6 +119,11 @@ def monitor_project(project_config, global_config):
 
 def main():
     """Main function to monitor multiple projects."""
+    # 添加命令行参数解析
+    parser = argparse.ArgumentParser(description='Monitor project structure and generate focus files')
+    parser.add_argument('-n', '--name', help='Specify project name to monitor (optional)')
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.WARNING,
         format='%(levelname)s: %(message)s'
@@ -155,6 +165,17 @@ def main():
             'max_depth': config.get('max_depth', 3)
         }]
 
+    # 如果指定了项目名称，过滤项目列表
+    if args.name:
+        filtered_projects = [p for p in config['projects'] if p['name'].lower() == args.name.lower()]
+        if not filtered_projects:
+            print(f"❌ Project '{args.name}' not found in configuration")
+            print("\nAvailable projects:")
+            for p in config['projects']:
+                print(f"- {p['name']}")
+            return
+        config['projects'] = filtered_projects
+
     from threading import Thread
     threads = []
     
@@ -182,7 +203,7 @@ def main():
             print("❌ No projects to monitor")
             return
 
-        print(f"\n📝 Monitoring {len(threads)} projects (Ctrl+C to stop)")
+        print(f"\n📝 Monitoring {len(threads)} project{'s' if len(threads) > 1 else ''} (Ctrl+C to stop)")
         
         while True:
             time.sleep(1)
