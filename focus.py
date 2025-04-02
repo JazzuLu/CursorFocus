@@ -8,7 +8,7 @@ from rules_generator import RulesGenerator
 from rules_watcher import ProjectWatcherManager
 import logging
 from auto_updater import AutoUpdater
-import argparse
+from dotenv import load_dotenv, set_key
 
 def retry_generate_rules(project_path, project_name, max_retries=3):
     """Retry generating rules file automatically."""
@@ -42,6 +42,30 @@ def retry_generate_rules(project_path, project_name, max_retries=3):
             print(f"✓ {os.path.basename(rules_file)}")
             return rules_file
         except Exception as e:
+            error_msg = str(e)
+            # Check if it's an API key error
+            if "GEMINI_API_KEY is required" in error_msg:
+                print("\n⚠️ Gemini API Key is not set")
+                print("Please enter your API key (get key at https://makersuite.google.com/app/apikey):")
+                api_key = input()
+                
+                if api_key.strip():
+                    # Save API key to .env file
+                    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+                    if not os.path.exists(env_path):
+                        with open(env_path, 'w') as f:
+                            f.write(f"GEMINI_API_KEY={api_key}")
+                    else:
+                        set_key(env_path, "GEMINI_API_KEY", api_key)
+                    
+                    # Reload environment variables
+                    load_dotenv(override=True)
+                    print("✓ API key has been saved")
+                    continue
+                else:
+                    print("❌ Invalid API key")
+                    raise ValueError("API key is not provided")
+            
             retries += 1
             if retries < max_retries:
                 wait_time = 2 * (2 ** (retries - 1))  # Exponential backoff
@@ -129,28 +153,30 @@ def main():
         format='%(levelname)s: %(message)s'
     )
 
-    # Check updates
-    print("\n🔄 Checking updates...")
-    updater = AutoUpdater()
-    update_info = updater.check_for_updates()
+    # # Check updates
+    # print("\n🔄 Checking updates...")
+    # updater = AutoUpdater()
+    # update_info = updater.check_for_updates()
     
-    if update_info:
-        print(f"📦 Update available: {update_info['message']}")
-        print(f"🕒 Date: {update_info['date']}")
-        print(f"👤 Author: {update_info['author']}")
-        try:
-            if input("Update now? (y/n): ").lower() == 'y':
-                print("⏳ Downloading...")
-                if updater.update(update_info):
-                    print("✅ Updated! Please restart")
-                    return
-                else:
-                    print("❌ Update failed")
-        except KeyboardInterrupt:
-            print("\n👋 Update canceled")
-            pass
-    else:
-        print("✓ Latest version")
+    # if update_info:
+    #     print(f"📦 Update available: {update_info['message']}")
+    #     print(f"🕒 Date: {update_info['date']}")
+    #     print(f"👤 Author: {update_info['author']}")
+    #     try:
+    #         if input("Update now? (y/n): ").lower() == 'y':
+    #             print("⏳ Downloading...")
+    #             if updater.update(update_info):
+    #                 print("✅ Updated! Please restart")
+    #                 return
+    #             else:
+    #                 print("❌ Update failed")
+    #     except KeyboardInterrupt:
+    #         print("\n👋 Update canceled")
+    #         pass
+    # else:
+    #     print("✓ Latest version")
+
+    print("\n✓ Automatic updates disabled")
 
     config = load_config()
     if not config:

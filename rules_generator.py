@@ -6,97 +6,9 @@ import google.generativeai as genai
 import re
 from rules_analyzer import RulesAnalyzer
 from dotenv import load_dotenv
-import time
-from functools import wraps
-import tqdm
-import threading
-import signal
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-import fnmatch
-import pathspec
-from generator.patterns import PATTERNS
-from generator.prompts import get_ai_rules_prompt
-
-class TimeoutException(Exception):
-    pass
-
-def timeout_handler(signum, frame):
-    raise TimeoutException("操作超时")
-
-# 设置超时处理
-signal.signal(signal.SIGALRM, timeout_handler)
-
-def show_progress_spinner():
-    """显示加载动画"""
-    spinner = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷']
-    i = 0
-    while True:
-        print(f"\r{spinner[i]} 处理中...", end='')
-        i = (i + 1) % len(spinner)
-        time.sleep(0.1)
-
-def with_progress(desc: str):
-    """进度条装饰器"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            spinner_thread = threading.Thread(target=show_progress_spinner)
-            spinner_thread.daemon = True
-            print(f"\n🔄 {desc}")
-            spinner_thread.start()
-            try:
-                result = func(*args, **kwargs)
-                print("\r✅ 完成" + " " * 20)
-                return result
-            except Exception as e:
-                print("\r❌ 失败" + " " * 20)
-                raise
-            finally:
-                spinner_thread.do_run = False
-                spinner_thread.join(0)
-        return wrapper
-    return decorator
-
-def retry_on_429(max_retries=3, delay=2):
-    """带进度的重试装饰器"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            retries = 0
-            while retries < max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if '429' in str(e) and retries < max_retries - 1:
-                        wait_time = delay * (2 ** retries)
-                        print(f"\r⚠️ 触发限流，{wait_time} 秒后重试... ({retries + 1}/{max_retries})")
-                        time.sleep(wait_time)
-                        retries += 1
-                        continue
-                    raise
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
+from patterns_analyzer import PatternsAnalyzer
 
 class RulesGenerator:
-
-    # 默认排除的目录和文件
-    DEFAULT_EXCLUDES = {
-        # 版本控制
-        '.git', '.svn', '.hg',
-        # Python
-        '__pycache__', '*.pyc', '*.pyo', '*.pyd', '.Python', 'env/', 'venv/', '.env', '.venv',
-        'pip-log.txt', 'pip-delete-this-directory.txt',
-        # Node.js
-        'node_modules/', 'npm-debug.log*', 'yarn-debug.log*', 'yarn-error.log*',
-        # IDE
-        '.idea/', '.vscode/', '*.swp', '*.swo',
-        # 构建输出
-        'build/', 'dist/', '*.egg-info/', '*.egg',
-        # 其他
-        '.DS_Store', 'Thumbs.db'
-    }
-
     def __init__(self, project_path: str):
         """初始化 RulesGenerator"""
         print("\n🔄 初始化 RulesGenerator...")
@@ -104,91 +16,33 @@ class RulesGenerator:
         self.analyzer = RulesAnalyzer(project_path)
         self.exclude_patterns = self._load_exclude_patterns()
         
-        with tqdm.tqdm(total=4, desc="初始化进度") as pbar:
-            # 编译正则表达式
-            print("📝 编译模式...")
-            self.compiled_patterns = self._compile_patterns()
-            pbar.update(1)
-            
-            # 加载环境变量
-            print("🔑 加载 API 配置...")
-            load_dotenv()
-            pbar.update(1)
-            
-            try:
-                api_key = os.environ.get("GEMINI_API_KEY")
-                api_base = os.environ.get("GOOGLE_API_BASE_URL", "https://generativelanguage.googleapis.com")
-                
-                if not api_key:
-                    raise ValueError("未设置 GEMINI_API_KEY 环境变量")
-
-                print("🤖 配置 Gemini AI...")
-                print(f"📡 使用 API base URL: {api_base}")
-                
-                # 设置 30 秒超时
-                signal.alarm(30)
-                try:
-                    genai.configure(
-                        api_key=api_key,
-                        transport="rest",
-                        client_options={"api_endpoint": api_base}
-                    )
-                    pbar.update(1)
-                    
-                    print("🚀 启动聊天会话...")
-                    self.model = genai.GenerativeModel(
-                        model_name="gemini-2.0-flash-exp",
-                        generation_config={
-                            "temperature": 0.7,
-                            "top_p": 0.95,
-                            "top_k": 40,
-                            "max_output_tokens": 8192,
-                        }
-                    )
-                    self.chat_session = self.model.start_chat(history=[])
-                    pbar.update(1)
-                    
-                    print("✅ RulesGenerator 初始化成功")
-                    
-                finally:
-                    signal.alarm(0)
-                    
-            except TimeoutException:
-                print("\n❌ API 初始化超时")
-                raise
-            except Exception as e:
-                print(f"\n❌ 初始化 Gemini AI 时出错: {str(e)}")
-                print("⚠️ 请确保在环境变量或 .env 文件中设置了 GEMINI_API_KEY 和 GOOGLE_API_BASE_URL")
-                print("🔍 当前 API key:", api_key[:10] + "..." if api_key else "未找到")
-                print("🌐 当前 base URL:", api_base)
-                raise
-
-    def _compile_patterns(self) -> Dict[str, Dict[str, Any]]:
-        """Precompile all regex patterns for better performance."""
-        compiled = {}
+        # Initialize pattern analyzer
+        patterns_analyzer = PatternsAnalyzer()
+        self.compiled_patterns = patterns_analyzer.compiled_patterns
+        self.get_language_from_ext = patterns_analyzer.get_language_from_ext
         
-        # Compile patterns for each category
-        for category, patterns in PATTERNS.items():
-            compiled[category] = {}
+        # Load environment variables from .env
+        load_dotenv()
+        
+        # Initialize Gemini AI
+        try:
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is required")
+
+            genai.configure(api_key=api_key)
             
-            if isinstance(patterns, dict):
-                # Handle nested patterns (import, class, function)
-                if category in ['import', 'class', 'function']:
-                    for lang_group, pattern in patterns.items():
-                        compiled[category][lang_group] = re.compile(pattern)
-                # Handle common patterns
-                elif category == 'common':
-                    for pattern_name, pattern in patterns.items():
-                        compiled[category][pattern_name] = re.compile(pattern)
-                # Handle Unity patterns
-                elif category == 'unity':
-                    for pattern_name, pattern in patterns.items():
-                        compiled[category][pattern_name] = re.compile(pattern)
-            else:
-                # Handle simple patterns
-                compiled[category] = re.compile(patterns)
-                
-        return compiled
+            # Get model name from environment or use default
+            model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro-exp-03-25")
+            
+            self.model = genai.GenerativeModel(
+                model_name=model_name,
+            )
+            self.chat_session = self.model.start_chat(history=[])
+            
+        except Exception as e:
+            print(f"\n⚠️ Error when initializing Gemini AI: {e}")
+            raise
 
     def _get_timestamp(self) -> str:
         """Get current timestamp in standard format."""
@@ -259,67 +113,55 @@ class RulesGenerator:
         # 获取所有非排除文件的总数
         total_files = 0
         for root, dirs, files in os.walk(self.project_path):
-            # 过滤掉要排除的目录
-            dirs[:] = [d for d in dirs if not self._should_exclude(os.path.join(root, d), True)]
-            # 过滤掉要排除的文件
-            files = [f for f in files if not self._should_exclude(os.path.join(root, f))]
-            total_files += len(files)
-        
-        with tqdm.tqdm(total=total_files, desc="分析文件") as pbar:
-            for root, dirs, files in os.walk(self.project_path):
-                # 过滤掉要排除的目录
-                dirs[:] = [d for d in dirs if not self._should_exclude(os.path.join(root, d), True)]
+            # Skip ignored directories
+            dirs[:] = [d for d in dirs if not any(x in d for x in ['node_modules', 'venv', '.git', '__pycache__', 'build', 'dist'])]
+            
+            rel_root = os.path.relpath(root, self.project_path)
+            if rel_root == '.':
+                rel_root = ''
                 
-                rel_root = os.path.relpath(root, self.project_path)
-                if rel_root == '.':
-                    rel_root = ''
-                    
-                # 初始化目录统计
-                dir_stats[rel_root] = {
-                    'total_files': 0,
-                    'code_files': 0,
-                    'languages': {},
-                    'frameworks': set(),
-                    'patterns': {
-                        'classes': 0,
-                        'functions': 0,
-                        'imports': 0
-                    }
+            # Initialize directory statistics
+            dir_stats[rel_root] = {
+                'total_files': 0,
+                'code_files': 0,
+                'languages': {},
+                'frameworks': set(),
+                'patterns': {
+                    'classes': 0,
+                    'functions': 0,
+                    'imports': 0
                 }
+            }
 
-                # 过滤掉要排除的文件
-                files = [f for f in files if not self._should_exclude(os.path.join(root, f))]
+            for file in files:
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, self.project_path)
                 
-                for file in files:
-                    pbar.update(1)
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_path, self.project_path)
+                # Update directory statistics
+                dir_stats[rel_root]['total_files'] += 1
+                
+                # Analyze code files
+                file_ext = os.path.splitext(file)[1].lower()
+                if file_ext in ['.py', '.js', '.ts', '.tsx', '.kt', '.php', '.swift', '.cpp', '.c', '.h', '.hpp', '.cs', '.csx', '.java', '.rb', '.objc']:
+                    structure['files'].append(rel_path)
+                    dir_stats[rel_root]['code_files'] += 1
                     
-                    # Update directory statistics
-                    dir_stats[rel_root]['total_files'] += 1
+                    # Update language statistics
+                    lang = self.get_language_from_ext(file_ext)
+                    dir_stats[rel_root]['languages'][lang] = dir_stats[rel_root]['languages'].get(lang, 0) + 1
+                    structure['languages'][lang] = structure['languages'].get(lang, 0) + 1
                     
-                    # Analyze code files
-                    file_ext = os.path.splitext(file)[1].lower()
-                    if file_ext in ['.py', '.js', '.ts', '.tsx', '.kt', '.php', '.swift', '.cpp', '.c', '.h', '.hpp', '.cs', '.csx', '.java', '.rb', '.objc']:
-                        structure['files'].append(rel_path)
-                        dir_stats[rel_root]['code_files'] += 1
-                        
-                        # Update language statistics
-                        lang = self._get_language_from_ext(file_ext)
-                        dir_stats[rel_root]['languages'][lang] = dir_stats[rel_root]['languages'].get(lang, 0) + 1
-                        structure['languages'][lang] = structure['languages'].get(lang, 0) + 1
-                        
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                                structure['code_contents'][rel_path] = content
-                                
-                                # Analyze based on file type
-                                self._analyze_file(content, rel_path, structure, lang)
-                                
-                        except Exception as e:
-                            print(f"⚠️ Error reading file {rel_path}: {e}")
-                            continue
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            structure['code_contents'][rel_path] = content
+                            
+                            # Analyze based on file type
+                            self._analyze_file(content, rel_path, structure, lang)
+                            
+                    except Exception as e:
+                        print(f"⚠️ Error reading file {rel_path}: {e}")
+                        continue
 
                     # Classify config files
                     elif file.endswith(('.json', '.ini', '.conf')):
@@ -346,28 +188,6 @@ class RulesGenerator:
         self._analyze_directory_patterns(structure, dir_stats)
         
         return structure
-
-    def _get_language_from_ext(self, ext: str) -> str:
-        """Get programming language from file extension."""
-        lang_map = {
-            '.py': 'Python',
-            '.js': 'JavaScript',
-            '.ts': 'TypeScript',
-            '.tsx': 'TypeScript/React',
-            '.kt': 'Kotlin',
-            '.php': 'PHP',
-            '.swift': 'Swift',
-            '.cpp': 'C++',
-            '.c': 'C',
-            '.h': 'C/C++ Header',
-            '.hpp': 'C++ Header',
-            '.cs': 'C#',
-            '.csx': 'C# Script',
-            '.java': 'Java',
-            '.rb': 'Ruby',
-            '.objc': 'Objective-C',
-        }
-        return lang_map.get(ext, 'Unknown')
 
     def _analyze_file(self, content: str, rel_path: str, structure: Dict[str, Any], language: str) -> None:
         """Generic file analyzer that handles all languages."""
@@ -482,7 +302,6 @@ class RulesGenerator:
                 'code_metrics': stats['patterns']
             })
 
-    @retry_on_429(max_retries=3, delay=2)
     def _generate_ai_rules(self, project_info: Dict[str, Any]) -> Dict[str, Any]:
         """Generate rules using Gemini AI based on project analysis."""
         try:
@@ -520,7 +339,6 @@ class RulesGenerator:
             print(f"⚠️ Error generating AI rules: {e}")
             raise
 
-    @retry_on_429(max_retries=3, delay=2)
     def _generate_project_description(self, project_structure: Dict[str, Any]) -> str:
         """Generate project description using AI based on project analysis."""
         try:
